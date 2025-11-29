@@ -1,3 +1,7 @@
+import io
+import zipfile
+import requests
+
 import joblib
 import pandas as pd
 import streamlit as st
@@ -13,7 +17,6 @@ st.set_page_config(
 )
 
 # DualSleep constants + feature helpers
-# Label dictionary (same as in your notebook)
 dualsleep_labels = {
     81: "wake",
     82: "non-rem1",
@@ -68,16 +71,8 @@ def to_windows_60s_uploaded(df_raw: pd.DataFrame, subject_id: str = "uploaded") 
     - compute same stats as in the training notebook
     - build y (sleep vs wake) from label
     - add circadian feature sleep_prob_clock (using this file's y)
-
-    Returns a win60-style DataFrame with:
-    - timestamp (minute start)
-    - subject_id
-    - y (0 = wake, 1 = sleep)
-    - all sensor summary features
-    - cyclic time features
-    - sleep_prob_clock
     """
-    # basic checks 
+    # basic checks
     missing = [c for c in RAW_REQUIRED_COLS if c not in df_raw.columns]
     if missing:
         raise ValueError(f"Raw file is missing required columns: {missing}")
@@ -170,7 +165,48 @@ def to_windows_60s_uploaded(df_raw: pd.DataFrame, subject_id: str = "uploaded") 
     return out
 
 
+# Helpers for different upload modes
+
+def _concat_csv_files(files) -> pd.DataFrame:
+    dfs = []
+    for f in files:
+        dfs.append(pd.read_csv(f))
+    return pd.concat(dfs, ignore_index=True)
+
+
+def load_from_zip(uploaded_zip) -> pd.DataFrame:
+    """Read one or more CSVs inside a ZIP and concatenate them."""
+    z = zipfile.ZipFile(uploaded_zip)
+    csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+    if not csv_names:
+        raise ValueError("No .csv files found inside the ZIP archive.")
+    dfs = []
+    for name in sorted(csv_names):
+        with z.open(name) as f:
+            dfs.append(pd.read_csv(f))
+    return pd.concat(dfs, ignore_index=True)
+
+
+def load_from_url(url: str) -> pd.DataFrame:
+    """Download CSV/ZIP from a URL and return concatenated DataFrame."""
+    resp = requests.get(url, stream=True)
+    resp.raise_for_status()
+    content = io.BytesIO(resp.content)
+
+    lower = url.lower()
+    if lower.endswith(".zip"):
+        return load_from_zip(content)
+    # try to detect zip by content-type, just in case
+    ctype = resp.headers.get("Content-Type", "").lower()
+    if "zip" in ctype:
+        return load_from_zip(content)
+
+    # assume CSV
+    return pd.read_csv(content)
+
+
 # Load model + data (cached)
+
 @st.cache_resource
 def load_model():
     """Load the saved SVM pipeline and metadata."""
@@ -376,7 +412,7 @@ with tab_upload:
 
     st.markdown(
         """
-Upload a **raw high-frequency DualSleep CSV** (like `PSGO_01.csv`) with columns:
+Upload a **raw high-frequency DualSleep dataset** with columns:
 
 - `timestamp`
 - `back_x`, `back_y`, `back_z`
@@ -384,24 +420,75 @@ Upload a **raw high-frequency DualSleep CSV** (like `PSGO_01.csv`) with columns:
 - `back_temp`, `thigh_temp`
 - `label` (81–86, DualSleep codes)
 
-The app will:
-1. Aggregate to **60-second windows**.
-2. Compute the same feature set used in training (including circadian features).
-3. Run the saved **RBF-SVM** and show predictions, metrics, and a timeline.
+**Streamlit Cloud limit:** 200MB per uploaded file.  
+To handle larger nights you can:
+- Upload a **compressed ZIP** containing one or more CSVs  
+- Upload **multiple CSV chunks** of the same night  
+- Provide a **URL** to a CSV/ZIP file hosted elsewhere (Drive/Dropbox/S3, etc.)
 """
     )
 
-    uploaded_raw = st.file_uploader(
-        "Upload raw DualSleep CSV (high-frequency sensor data)",
-        type=["csv"],
-        key="raw_uploader",
+    mode = st.radio(
+        "Choose how to provide your data:",
+        [
+            "Single CSV file (≤200MB)",
+            "ZIP file with one or more CSVs",
+            "Multiple CSV files (night split into chunks)",
+            "URL to CSV/ZIP (public link)",
+        ],
+        index=0,
     )
 
-    if uploaded_raw is not None:
-        try:
-            # Load raw file
-            df_raw = pd.read_csv(uploaded_raw)
+    df_raw = None
+    source_desc = None
 
+    try:
+        if mode == "Single CSV file (≤200MB)":
+            uploaded_raw = st.file_uploader(
+                "Upload a single DualSleep CSV",
+                type=["csv"],
+                key="single_csv",
+            )
+            if uploaded_raw is not None:
+                df_raw = pd.read_csv(uploaded_raw)
+                source_desc = "single uploaded CSV"
+
+        elif mode == "ZIP file with one or more CSVs":
+            uploaded_zip = st.file_uploader(
+                "Upload a ZIP file containing one or more DualSleep CSVs",
+                type=["zip"],
+                key="zip_upload",
+            )
+            if uploaded_zip is not None:
+                df_raw = load_from_zip(uploaded_zip)
+                source_desc = "ZIP archive"
+
+        elif mode == "Multiple CSV files (night split into chunks)":
+            uploaded_many = st.file_uploader(
+                "Upload one or more CSV files (they will be concatenated in order)",
+                type=["csv"],
+                accept_multiple_files=True,
+                key="multi_csv",
+            )
+            if uploaded_many:
+                df_raw = _concat_csv_files(uploaded_many)
+                source_desc = f"{len(uploaded_many)} CSV chunks"
+
+        elif mode == "URL to CSV/ZIP (public link)":
+            url = st.text_input(
+                "Paste a direct link to a CSV or ZIP file (must be publicly accessible)"
+            )
+            fetch = st.button("Fetch data from URL")
+            if fetch and url:
+                df_raw = load_from_url(url.strip())
+                source_desc = "remote URL"
+
+    except Exception as e:
+        st.error(f"Error while loading data: {e}")
+
+    if df_raw is not None:
+        try:
+            st.success(f"Loaded raw data from {source_desc}.")
             st.write("Raw file shape:", df_raw.shape)
             st.write("Columns:", list(df_raw.columns))
 
@@ -460,7 +547,7 @@ The app will:
                 # Distance from threshold as a rough confidence score
                 dist_from_thr = np.abs(scores_user - FINAL_THR)
 
-                # Define confidence bands (you can tweak the boundaries)
+                # Define confidence bands
                 conf_bins = [0, 0.5, 1.5, np.inf]
                 conf_labels = ["low", "medium", "high"]
                 conf_cat = pd.cut(
@@ -555,7 +642,7 @@ We treat the **distance from the decision threshold** as a rough measure of conf
         except Exception as e:
             st.error(f"Error while processing uploaded raw CSV: {e}")
     else:
-        st.info("Upload a DualSleep-style raw CSV to run the full pipeline.")
+        st.info("Provide a DualSleep-style raw dataset to run the full pipeline.")
 
 # TAB 4: How the model works
 with tab_info:
