@@ -185,10 +185,10 @@ def load_model():
 def load_preds():
     """
     Load final minute-level predictions and per-subject metrics.
-    - preds_final.parquet: timestamp, subject_id, y, y_pred
+    - preds_final.csv: timestamp, subject_id, y, y_pred
     - per_subject_final.csv: sensitivity, specificity, f1_macro per subject
     """
-    preds = pd.read_parquet("preds_final.parquet")
+    preds = pd.read_csv("preds_final.csv", parse_dates=["timestamp"])
     per_subj = pd.read_csv("per_subject_final.csv", index_col=0)
     return preds, per_subj
 
